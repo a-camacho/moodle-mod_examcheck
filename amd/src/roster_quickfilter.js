@@ -14,19 +14,30 @@
 // along with Moodle.  If not, see <http://www.gnu.org/licenses/>.
 
 /**
- * Quick view-switch buttons for the checking roster.
+ * Quick view-switch tabs for the checking roster.
  *
- * Adds a three-button group (All / Not yet checked / Checked) above the
- * roster table so invigilators can switch between views with a single tap
- * rather than adding and removing datafilter chips.
+ * Adds three buttons above the roster table:
  *
- * The filter is applied client-side by toggling row visibility, so it
- * survives live-poll refreshes and table reloads without disturbing the
- * server-side datafilter chip state or the keyword search.
+ *  - "Not yet checked" — re-applies whatever checkstatus filter the invigilator
+ *    has set in the datafilter bar above (the default working view). The live
+ *    auto-update removes rows as students are checked in.
  *
- * "Not yet checked" shows rows where at least one step toggle is unchecked.
- * "Checked"         shows rows where every step toggle is checked.
- * "All students"    removes the client-side overlay and shows all rows.
+ *  - "Checked" — applies the inverse of the active checkstatus filter so the
+ *    invigilator can review or correct already-checked students. Live update
+ *    keeps running in this view.
+ *
+ *  - "All students" — suspends the checkstatus filter, showing everyone.
+ *    Keywords and group filters from the datafilter bar are preserved. Live
+ *    update keeps running.
+ *
+ * Switching between tabs calls DynamicTable.setFilters() so all three views
+ * benefit from the full server-side live-update cycle. Keywords and group
+ * filters set in the datafilter bar are always preserved — only the checkstatus
+ * part of the filterset is swapped.
+ *
+ * The module tracks the current filterset by listening for the
+ * {@see mod_examcheck/roster_filter~Events.filtersetChanged} custom event that
+ * roster_filter.js dispatches after every successful filter apply.
  *
  * @module     mod_examcheck/roster_quickfilter
  * @copyright  2026 André Camacho
@@ -36,15 +47,21 @@
 import {get_strings as getStrings} from 'core/str';
 import * as DynamicTable from 'core_table/dynamic';
 import Notification from 'core/notification';
-
-/** @type {string} Active quick-filter value: 'all' | 'notchecked' | 'checked'. */
-let activeFilter = 'all';
-
-/** @type {MutationObserver|null} Observer tracking data-checked attribute changes. */
-let toggleObserver = null;
+import {Events as FilterEvents} from 'mod_examcheck/roster_filter';
 
 /**
- * Initialise the quick-filter bar for the given activity.
+ * The last filterset applied by the datafilter bar.
+ * Starts empty (no filters) which matches the table's initial server-side state.
+ *
+ * @type {{jointype: Number, filters: Array}}
+ */
+let storedFilterset = {jointype: 0, filters: []};
+
+/** @type {string} The currently active tab value: 'notchecked' | 'checked' | 'all'. */
+let activeTab = 'all';
+
+/**
+ * Initialise the quick-filter tab bar for the given activity.
  *
  * @param {Number} cmid Course module id.
  */
@@ -56,20 +73,30 @@ export const init = async (cmid) => {
     }
 
     try {
-        const [labelAll, labelNotChecked, labelChecked, labelGroup] = await getStrings([
-            {key: 'quickfilterall',        component: 'mod_examcheck'},
+        const [labelNotChecked, labelChecked, labelAll, labelGroup] = await getStrings([
             {key: 'quickfilternotchecked', component: 'mod_examcheck'},
             {key: 'quickfilterchecked',    component: 'mod_examcheck'},
+            {key: 'quickfilterall',        component: 'mod_examcheck'},
             {key: 'quickfiltergroup',      component: 'mod_examcheck'},
         ]);
 
-        buildButtonGroup(container, labelAll, labelNotChecked, labelChecked, labelGroup);
-        bindButtons(container, root);
-        observeToggleChanges(root);
+        buildButtonGroup(container, labelNotChecked, labelChecked, labelAll, labelGroup);
+        bindButtons(container, root, cmid);
 
-        // Re-apply after every dynamic-table AJAX reload (live poll, filter change, sort).
-        root.addEventListener(DynamicTable.Events.tableContentRefreshed, () => {
-            applyFilter(root, container);
+        // Track every filterset change made via the datafilter chip bar above.
+        root.addEventListener(FilterEvents.filtersetChanged, (e) => {
+            storedFilterset = {jointype: e.detail.jointype, filters: e.detail.filters};
+
+            // When the invigilator applies or changes a checkstatus chip,
+            // sync the active tab to "Not yet checked" so the UI reflects reality.
+            const hasCheckstatus = e.detail.filters.some((f) => f.name === 'checkstatus');
+            if (hasCheckstatus) {
+                setActiveTab('notchecked', container);
+                activeTab = 'notchecked';
+            } else {
+                setActiveTab('all', container);
+                activeTab = 'all';
+            }
         });
     } catch (e) {
         Notification.exception(e);
@@ -80,21 +107,21 @@ export const init = async (cmid) => {
  * Build and insert the Bootstrap button group into the container.
  *
  * @param {HTMLElement} container       The target div.
- * @param {String}      labelAll        Localised label for "All students".
  * @param {String}      labelNotChecked Localised label for "Not yet checked".
  * @param {String}      labelChecked    Localised label for "Checked".
+ * @param {String}      labelAll        Localised label for "All students".
  * @param {String}      labelGroup      Localised accessible name for the button group.
  */
-const buildButtonGroup = (container, labelAll, labelNotChecked, labelChecked, labelGroup) => {
+const buildButtonGroup = (container, labelNotChecked, labelChecked, labelAll, labelGroup) => {
     const group = document.createElement('div');
     group.className = 'btn-group';
     group.setAttribute('role', 'group');
     group.setAttribute('aria-label', labelGroup);
 
     const buttons = [
-        {value: 'all',        label: labelAll,        active: true},
         {value: 'notchecked', label: labelNotChecked, active: false},
         {value: 'checked',    label: labelChecked,    active: false},
+        {value: 'all',        label: labelAll,        active: true},
     ];
 
     buttons.forEach(({value, label, active}) => {
@@ -115,125 +142,109 @@ const buildButtonGroup = (container, labelAll, labelNotChecked, labelChecked, la
  *
  * @param {HTMLElement} container The container holding the button group.
  * @param {HTMLElement} root      The dashboard region.
+ * @param {Number}      cmid      Course module id.
  */
-const bindButtons = (container, root) => {
+const bindButtons = (container, root, cmid) => {
     container.addEventListener('click', (e) => {
         const btn = e.target.closest('[data-quickfilter]');
         if (!btn) {
             return;
         }
-        activeFilter = btn.dataset.quickfilter;
 
-        container.querySelectorAll('[data-quickfilter]').forEach((b) => {
-            const isActive = b === btn;
-            b.classList.toggle('btn-secondary', isActive);
-            b.classList.toggle('btn-outline-secondary', !isActive);
-            b.setAttribute('aria-pressed', isActive ? 'true' : 'false');
-        });
-
-        applyFilter(root, container);
-    });
-};
-
-/**
- * Apply the current activeFilter to all roster rows by toggling visibility.
- *
- * @param {HTMLElement} root      The dashboard region.
- * @param {HTMLElement} container The container holding the button group.
- */
-const applyFilter = (root, container) => {
-    root.querySelectorAll('.examcheck-roster tbody tr').forEach((row) => {
-        const toggles = Array.from(row.querySelectorAll('[data-action="examcheck-toggle"]'));
-
-        // Rows without any toggle (e.g. "no students" notice row) are always visible.
-        if (!toggles.length) {
-            row.hidden = false;
+        const tab = btn.dataset.quickfilter;
+        if (tab === activeTab) {
             return;
         }
 
-        const allChecked   = toggles.every((t) => t.dataset.checked === '1');
-        const anyUnchecked = toggles.some((t)  => t.dataset.checked === '0');
-
-        switch (activeFilter) {
-            case 'notchecked':
-                row.hidden = !anyUnchecked;
-                break;
-            case 'checked':
-                row.hidden = !allChecked;
-                break;
-            default: // 'all'
-                row.hidden = false;
-        }
+        activeTab = tab;
+        setActiveTab(tab, container);
+        applyTab(tab, cmid);
     });
-
-    updateCounter(root, container);
 };
 
 /**
- * Update the visible/total counter shown next to the button group.
+ * Update the visual active state of the tab buttons.
  *
- * The counter is only rendered when a filter is active so it does not
- * clutter the UI under normal "All students" browsing.
- *
- * @param {HTMLElement} root      The dashboard region.
+ * @param {String}      tab       The tab value to mark active.
  * @param {HTMLElement} container The container holding the button group.
  */
-const updateCounter = (root, container) => {
-    let counter = container.querySelector('.examcheck-quickfilter-count');
+const setActiveTab = (tab, container) => {
+    container.querySelectorAll('[data-quickfilter]').forEach((b) => {
+        const isActive = b.dataset.quickfilter === tab;
+        b.classList.toggle('btn-secondary', isActive);
+        b.classList.toggle('btn-outline-secondary', !isActive);
+        b.setAttribute('aria-pressed', isActive ? 'true' : 'false');
+    });
+};
 
-    if (activeFilter === 'all') {
-        if (counter) {
-            counter.remove();
-        }
+/**
+ * Apply the filterset corresponding to the given tab by calling
+ * DynamicTable.setFilters(). Keywords and group filters from the datafilter
+ * bar are always preserved; only the checkstatus part changes.
+ *
+ * @param {String} tab  The tab value: 'notchecked' | 'checked' | 'all'.
+ * @param {Number} cmid Course module id.
+ */
+const applyTab = (tab, cmid) => {
+    const table = DynamicTable.getTableFromId(`examcheck-roster-${cmid}`);
+    if (!table) {
         return;
     }
 
-    const rows = root.querySelectorAll('.examcheck-roster tbody tr');
-    let total   = 0;
-    let visible = 0;
-    rows.forEach((row) => {
-        if (row.querySelectorAll('[data-action="examcheck-toggle"]').length) {
-            total++;
-            if (!row.hidden) {
-                visible++;
-            }
-        }
-    });
-
-    if (!counter) {
-        counter = document.createElement('span');
-        counter.className = 'examcheck-quickfilter-count ms-2 text-muted small align-self-center';
-        container.appendChild(counter);
+    let filterset;
+    switch (tab) {
+        case 'notchecked':
+            // Restore whatever the invigilator set in the datafilter bar.
+            filterset = storedFilterset;
+            break;
+        case 'checked':
+            // Invert the checkstatus values: notchecked ↔ checked.
+            filterset = invertCheckstatus(storedFilterset);
+            break;
+        default: // 'all'
+            // Remove the checkstatus filter; keep keywords and groups.
+            filterset = withoutCheckstatus(storedFilterset);
     }
-    counter.textContent = `${visible} / ${total}`;
+
+    DynamicTable.setFilters(table, filterset).catch(Notification.exception);
 };
 
 /**
- * Watch for data-checked attribute mutations so the overlay stays correct
- * when checker.js marks or unmarks a student without triggering a full
- * table reload (i.e. when no server-side checkstatus filter is active).
+ * Return a copy of the filterset with checkstatus values inverted.
+ * "notchecked" becomes "checked" and vice versa; other filters are unchanged.
  *
- * @param {HTMLElement} root The dashboard region.
+ * @param {{jointype: Number, filters: Array}} filterset The source filterset.
+ * @returns {{jointype: Number, filters: Array}} The inverted filterset.
  */
-const observeToggleChanges = (root) => {
-    if (toggleObserver) {
-        toggleObserver.disconnect();
-    }
-
-    const container = root.querySelector('[data-region="examcheck-quickfilter"]');
-
-    toggleObserver = new MutationObserver((mutations) => {
-        const relevant = mutations.some(
-            (m) => m.type === 'attributes' && m.attributeName === 'data-checked'
-        );
-        if (relevant) {
-            applyFilter(root, container);
+const invertCheckstatus = (filterset) => ({
+    ...filterset,
+    filters: filterset.filters.map((f) => {
+        if (f.name !== 'checkstatus') {
+            return f;
         }
-    });
+        return {
+            ...f,
+            values: f.values.map((v) => {
+                if (v.endsWith(':notchecked')) {
+                    return v.replace(':notchecked', ':checked');
+                }
+                if (v.endsWith(':checked')) {
+                    return v.replace(':checked', ':notchecked');
+                }
+                return v;
+            }),
+        };
+    }),
+});
 
-    toggleObserver.observe(root, {
-        subtree:         true,
-        attributes:      true,
-        attributeFilter: ['data-checked'],
-    });
-};
+/**
+ * Return a copy of the filterset with the checkstatus filter removed.
+ * Keywords, groups and any other filters are preserved unchanged.
+ *
+ * @param {{jointype: Number, filters: Array}} filterset The source filterset.
+ * @returns {{jointype: Number, filters: Array}} The filterset without checkstatus.
+ */
+const withoutCheckstatus = (filterset) => ({
+    ...filterset,
+    filters: filterset.filters.filter((f) => f.name !== 'checkstatus'),
+});
