@@ -90,6 +90,25 @@ class mod_examcheck_mod_form extends moodleform_mod {
         $this->add_action_buttons();
     }
 
+
+    /**
+     * Pre-process the data loaded from the DB before it is set on the form.
+     *
+     * The uncheckreasons field is stored as a comma-separated string in the DB
+     * but the form element is a multi-select that expects an array.
+     *
+     * @param array $defaultvalues The values loaded from the DB, passed by reference.
+     */
+    public function data_preprocessing(&$defaultvalues) {
+        parent::data_preprocessing($defaultvalues);
+
+        if (isset($defaultvalues['uncheckreasons']) && is_string($defaultvalues['uncheckreasons'])) {
+            $defaultvalues['uncheckreasons'] = $defaultvalues['uncheckreasons'] !== ''
+                ? explode(',', $defaultvalues['uncheckreasons'])
+                : [];
+        }
+    }
+
     /**
      * Add the custom completion rule controls.
      *
